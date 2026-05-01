@@ -1,0 +1,143 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from transformers import pipeline
+from keybert import KeyBERT
+from datetime import datetime
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# -----------------------------
+# Load AI Models (FinBERT + KeyBERT)
+# -----------------------------
+print("Loading AI models...")
+sentiment_model = pipeline(
+    "sentiment-analysis",
+    model="ProsusAI/finbert"
+)
+kw_model = KeyBERT()
+
+# -----------------------------
+# Step 1: Get Yahoo Finance News Links
+# -----------------------------
+def get_yahoo_news(stock):
+    url = f"https://finance.yahoo.com/quote/{stock}/news"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    response = requests.get(url, headers=headers)
+    soup = BeautifulSoup(response.text, "lxml")
+
+    articles = []
+
+    for h3 in soup.find_all("h3"):
+        a_tag = h3.find("a")
+        if a_tag and a_tag.get("href"):
+            headline = h3.text.strip()
+            link = a_tag["href"]
+
+            if link.startswith("/"):
+                link = "https://finance.yahoo.com" + link
+
+            articles.append((headline, link))
+
+    return articles[:10]  # limit to 10 articles per stock
+
+# -----------------------------
+# Step 2: Extract article text
+# -----------------------------
+def get_article_text(url):
+    try:
+        page = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        soup = BeautifulSoup(page.text, "lxml")
+
+        paragraphs = soup.find_all("p")
+        text = " ".join([p.text for p in paragraphs])
+
+        return text
+    except:
+        return ""
+
+# -----------------------------
+# Step 3: Analyze sentiment + keywords
+# -----------------------------
+def analyze_text(text):
+    if len(text) < 200:
+        return "neutral", []
+
+    text = text[:1000]  # limit for model
+
+    result = sentiment_model(text)[0]
+    keywords = kw_model.extract_keywords(text, top_n=5)
+
+    return result["label"], [kw[0] for kw in keywords]
+
+# -----------------------------
+# Step 4: Process one stock
+# -----------------------------
+def process_stock(stock):
+    print(f"\nProcessing {stock}...")
+    news_list = get_yahoo_news(stock)
+
+    data = []
+
+    for headline, link in news_list:
+        article_text = get_article_text(link)
+        sentiment, keywords = analyze_text(article_text)
+
+        data.append({
+            "stock": stock,
+            "headline": headline,
+            "sentiment": sentiment,
+            "keywords": ", ".join(keywords),
+            "url": link
+        })
+
+    return pd.DataFrame(data)
+
+# -----------------------------
+# Step 5: Generate insight
+# -----------------------------
+def generate_insight(df, stock):
+    stock_df = df[df["stock"] == stock]
+
+    counts = stock_df["sentiment"].value_counts()
+    dominant = counts.idxmax()
+
+    all_keywords = (
+        stock_df["keywords"]
+        .str.split(", ")
+        .explode()
+        .value_counts()
+        .head(5)
+        .index
+    )
+
+    keywords = ", ".join(all_keywords)
+
+    return f"{stock} sentiment is mostly {dominant} today driven by: {keywords}"
+
+# -----------------------------
+# Main Execution
+# -----------------------------
+if __name__ == "__main__":
+    stocks = ["MSFT", "GOOGL", "AAPL", "TSLA", "META"]
+
+    final_df = pd.DataFrame()
+
+    for stock in stocks:
+        df = process_stock(stock)
+        final_df = pd.concat([final_df, df], ignore_index=True)
+
+    # Save report
+    today = datetime.now().strftime("%Y-%m-%d")
+    filename = f"daily_sentiment_report_{today}.csv"
+    final_df.to_csv(filename, index=False)
+
+    print(f"\nReport saved as: {filename}")
+
+    # Print insights
+    print("\n📊 DAILY INSIGHTS")
+    print("---------------------------")
+    for s in stocks:
+        print(generate_insight(final_df, s))
